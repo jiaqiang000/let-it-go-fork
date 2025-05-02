@@ -1,0 +1,14 @@
+name: zvuk
+
+num_items: 107448
+embedding_dim: 128
+max_length: 128
+
+train_filepath:
+val_filepath:
+test_filepath:
+gt_filepath:
+
+item_embeddings:
+    warm:
+    cold:

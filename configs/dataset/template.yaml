@@ -1,0 +1,14 @@
+name:
+
+num_items:
+embedding_dim:
+max_length:
+
+train_filepath:
+val_filepath:
+test_filepath:
+gt_filepath:
+
+item_embeddings:
+    warm:
+    cold:

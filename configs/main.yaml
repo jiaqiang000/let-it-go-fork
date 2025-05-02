@@ -1,0 +1,41 @@
+defaults:
+    - _self_
+    - dataset: zvuk
+
+project_name:
+
+checkpoint_dir:
+
+seed: 42
+
+use_pretrained_item_embeddings: False
+train_delta: False
+max_delta_norm: 0.5
+
+model:
+    num_items: ${dataset.num_items}
+    embedding_dim: ${dataset.embedding_dim}
+    num_blocks: 2
+    num_heads: 1
+    p: 0.3
+    max_length: ${dataset.max_length}
+
+recommender:
+    learning_rate: 1e-3
+    remove_seen: True
+    metrics: ['NDCG', 'Recall']
+    topk: 10
+
+early_stopping:
+    monitor: recommender-val-NDCG@10
+    patience: 5
+    mode: max
+    
+model_checkpoint:
+    monitor: ${early_stopping.monitor}
+    mode: ${early_stopping.mode}
+
+trainer:
+    devices: [0]
+    max_epochs: 100
+    val_check_interval: 1.0

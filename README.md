@@ -64,3 +64,6 @@ where:
 
 ![ndcg10_vs_delta](images/ndcg10_vs_delta.png)
 **Figure 1.** NDCG@10 as a function of $\delta_{\text{max}}$ (Amazon-M2).
+
+![ndcg10_low_frequency_items](images/ndcg10_low_frequency_items.png)
+**Figure 2.** Model performance on low-frequency items (Amazon-M2). Absolute metric values for each model (left) and corresponding values relative to the original SASRec model (right).

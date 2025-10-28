@@ -67,3 +67,6 @@ where:
 
 ![ndcg10_low_frequency_items](images/ndcg10_low_frequency_items.png)
 **Figure 2.** Model performance on low-frequency items (Amazon-M2). Absolute metric values for each model (left) and corresponding values relative to the original SASRec model (right).
+
+### Data Availability
+The processed datasets and embeddings are available on [Google Drive](https://drive.google.com/drive/folders/1Xq6CsBxf5R8_yKram9qUQvyzVt5FOyIN?usp=sharing).

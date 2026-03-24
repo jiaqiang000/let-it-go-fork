@@ -1,3 +1,7 @@
+#先暂时把row_data忽略提交
+row_data/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

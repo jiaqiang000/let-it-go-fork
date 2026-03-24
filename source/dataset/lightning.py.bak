@@ -17,7 +17,7 @@ class SequentialDataModule(LightningDataModule):
         timestamp_column: str = 'timestamp',
         max_length: int = 64,
         batch_size: int = 128,
-        num_workers: int = 32,
+        num_workers: int = 128,
     ) -> None:
         super().__init__()
 

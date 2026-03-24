@@ -22,7 +22,7 @@ class ColdStartEvaluationPipeline:
         timestamp_column: str = 'timestamp',
         cold_flag_column: str = 'is_cold',
         batch_size: int = 128,
-        num_workers: int = 32,
+        num_workers: int = 128,
     ) -> None:
         self.recommender = recommender
         self.trainer = trainer

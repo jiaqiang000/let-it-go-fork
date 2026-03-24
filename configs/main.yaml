@@ -11,6 +11,14 @@ seed: 42
 use_pretrained_item_embeddings: False
 train_delta: False
 max_delta_norm: 0.5
+quality_aware_delta: False
+
+quality_score:
+    warm_filepath:
+    cold_filepath:
+    min_budget: 0.3
+    max_budget: 0.6
+    reverse_budget: False
 
 model:
     num_items: ${dataset.num_items}

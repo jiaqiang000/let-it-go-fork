@@ -1,4 +1,11 @@
 from .lightning import ColdStartSequentialRecommender
-from .trainable_delta import SASRecModelWithTrainableDelta
+from .trainable_delta import (
+    SASRecModelWithQualityAwareTrainableDelta,
+    SASRecModelWithTrainableDelta,
+)
 
-__all__ = ['ColdStartSequentialRecommender', 'SASRecModelWithTrainableDelta']
+__all__ = [
+    'ColdStartSequentialRecommender',
+    'SASRecModelWithTrainableDelta',
+    'SASRecModelWithQualityAwareTrainableDelta',
+]

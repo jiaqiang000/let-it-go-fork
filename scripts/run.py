@@ -20,14 +20,25 @@ from source.optimizer import ConstrainedNormAdam
 from source.recommender import SASRecModel
 
 from source.winter.evaluation import ColdStartEvaluationPipeline
-from source.winter.recommender import ColdStartSequentialRecommender, SASRecModelWithTrainableDelta
+from source.winter.recommender import (
+    ColdStartSequentialRecommender,
+    SASRecModelWithQualityAwareTrainableDelta,
+    SASRecModelWithTrainableDelta,
+)
 
 
 def get_task_name(config: DictConfig) -> str:
     task_name = 'init({})'.format('text' if config.use_pretrained_item_embeddings else 'rand')
 
     if config.train_delta:
-        task_name += f'-delta-{config.max_delta_norm}'
+        if config.quality_aware_delta:
+            task_name += (
+                f"-quality-budget-{config.quality_score.min_budget}-{config.quality_score.max_budget}"
+            )
+            if config.quality_score.reverse_budget:
+                task_name += '-reverse'
+        else:
+            task_name += f'-delta-{config.max_delta_norm}'
 
     return task_name
 
@@ -50,7 +61,82 @@ def get_datamodule(config: DictConfig) -> SequentialDataModule:
     )
 
 
-def get_model(config: DictConfig) -> SASRecModel:
+def _validate_quality_scores(
+    quality_scores: torch.Tensor,
+    expected_size: int,
+    split_name: str,
+) -> torch.Tensor:
+    if quality_scores.ndim != 1:
+        raise ValueError(
+            f'{split_name} quality scores must be 1D, found shape {tuple(quality_scores.shape)}.'
+        )
+
+    if quality_scores.shape[0] != expected_size:
+        raise ValueError(
+            f'{split_name} quality scores length must be {expected_size}, '
+            f'found {quality_scores.shape[0]}.'
+        )
+
+    if torch.any((quality_scores < -1e-6) | (quality_scores > 1.0 + 1e-6)):
+        raise ValueError(f'{split_name} quality scores must be within [0, 1].')
+
+    return quality_scores.clamp(0.0, 1.0).float()
+
+
+def load_quality_scores(config: DictConfig) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not config.quality_aware_delta:
+        return None, None
+
+    if not config.train_delta:
+        raise ValueError('`quality_aware_delta=True` requires `train_delta=True`.')
+
+    if not config.use_pretrained_item_embeddings:
+        raise ValueError('`quality_aware_delta=True` requires `use_pretrained_item_embeddings=True`.')
+
+    if not config.quality_score.warm_filepath or not config.quality_score.cold_filepath:
+        raise ValueError(
+            'Quality-aware delta requires both `quality_score.warm_filepath` and '
+            '`quality_score.cold_filepath`.'
+        )
+
+    warm_quality = torch.tensor(np.load(config.quality_score.warm_filepath))
+    cold_quality = torch.tensor(np.load(config.quality_score.cold_filepath))
+
+    warm_quality = _validate_quality_scores(
+        warm_quality,
+        config.model.num_items,
+        'warm',
+    )
+    cold_quality = _validate_quality_scores(
+        cold_quality,
+        cold_quality.shape[0],
+        'cold',
+    )
+
+    return warm_quality, cold_quality
+
+
+def build_delta_budget(config: DictConfig, quality_scores: torch.Tensor) -> torch.Tensor:
+    min_budget = float(config.quality_score.min_budget)
+    max_budget = float(config.quality_score.max_budget)
+
+    if min_budget < 0 or max_budget <= 0 or min_budget > max_budget:
+        raise ValueError(
+            '`quality_score.min_budget` and `quality_score.max_budget` must satisfy '
+            '0 <= min_budget <= max_budget.'
+        )
+
+    budget_span = max_budget - min_budget
+    if config.quality_score.reverse_budget:
+        return min_budget + quality_scores * budget_span
+
+    return min_budget + (1.0 - quality_scores) * budget_span
+
+
+def get_model(
+    config: DictConfig,
+    warm_delta_budget: torch.Tensor | None = None,
+) -> SASRecModel:
     model_params = dict(
         num_items=config.model.num_items,
         embedding_dim=config.model.embedding_dim,
@@ -62,9 +148,18 @@ def get_model(config: DictConfig) -> SASRecModel:
     )
 
     if config.train_delta:
+        if config.quality_aware_delta:
+            if warm_delta_budget is None:
+                raise ValueError('warm delta budget is required for quality-aware delta.')
+
+            return SASRecModelWithQualityAwareTrainableDelta(
+                delta_budget=warm_delta_budget,
+                **model_params,
+            )
+
         return SASRecModelWithTrainableDelta(max_delta_norm=config.max_delta_norm, **model_params)
-    else:
-        return SASRecModel(**model_params)
+
+    return SASRecModel(**model_params)
 
 
 def get_trainer(config: DictConfig) -> Trainer:
@@ -108,10 +203,42 @@ def get_item_embeddings(config: DictConfig) -> Tuple[torch.Tensor, torch.Tensor]
     return torch.tensor(warm_item_embeddings).float(), torch.tensor(cold_item_embeddings).float()
 
 
-def add_cold_item_embeddings(model: SASRecModel, cold_item_embeddings: torch.Tensor) -> None:
+def add_cold_item_embeddings(
+    model: SASRecModel,
+    cold_item_embeddings: torch.Tensor,
+    cold_quality_scores: torch.Tensor | None = None,
+) -> None:
     item_embeddings = model.item_embedding.weight[: model.num_items + 1]
 
-    if isinstance(model, SASRecModelWithTrainableDelta):
+    if isinstance(model, SASRecModelWithQualityAwareTrainableDelta):
+        if cold_quality_scores is not None and cold_quality_scores.shape[0] != cold_item_embeddings.shape[0]:
+            raise ValueError(
+                'cold quality scores length must match the number of cold item embeddings.'
+            )
+
+        delta_embeddings = model.delta_embedding.weight[: model.num_items + 1]
+        cold_budget = torch.zeros(
+            cold_item_embeddings.shape[0],
+            dtype=model.delta_budget.dtype,
+            device=model.delta_budget.device,
+        )
+        delta_budget = torch.cat([model.delta_budget.detach().clone(), cold_budget], dim=0)
+
+        model.set_pretrained_item_embeddings(
+            item_embeddings=torch.vstack(
+                [item_embeddings, cold_item_embeddings.to(item_embeddings.device)]
+            ),
+            delta_embeddings=torch.vstack(
+                [
+                    delta_embeddings,
+                    torch.zeros_like(cold_item_embeddings).to(delta_embeddings.device),
+                ]
+            ),
+            delta_budget=delta_budget,
+            add_padding_embedding=False,
+            freeze=True,
+        )
+    elif isinstance(model, SASRecModelWithTrainableDelta):
         delta_embeddings = model.delta_embedding.weight[: model.num_items + 1]
         model.set_pretrained_item_embeddings(
             item_embeddings=torch.vstack(
@@ -175,8 +302,13 @@ def main(config: DictConfig) -> None:
     if not os.path.exists(os.path.join(config.checkpoint_dir, task.id)):
         os.makedirs(os.path.join(config.checkpoint_dir, task.id))
 
+    warm_quality_scores, cold_quality_scores = load_quality_scores(config)
+    warm_delta_budget = (
+        build_delta_budget(config, warm_quality_scores) if warm_quality_scores is not None else None
+    )
+
     datamodule = get_datamodule(config)
-    model = get_model(config)
+    model = get_model(config, warm_delta_budget=warm_delta_budget)
 
     # Set pre-trained item embeddings if necessary
     if config.use_pretrained_item_embeddings:
@@ -197,7 +329,10 @@ def main(config: DictConfig) -> None:
     )
 
     # Change optimizer if necessary
-    if isinstance(model, SASRecModelWithTrainableDelta):
+    if isinstance(model, SASRecModelWithTrainableDelta) and not isinstance(
+        model,
+        SASRecModelWithQualityAwareTrainableDelta,
+    ):
         recommender.configure_optimizers = lambda: ConstrainedNormAdam(
             model.parameters(),
             constrained_params=model.delta_embedding.parameters(),
@@ -222,7 +357,11 @@ def main(config: DictConfig) -> None:
 
     # Set cold item embeddings
     if config.use_pretrained_item_embeddings:
-        add_cold_item_embeddings(recommender.model, cold_item_embeddings)
+        add_cold_item_embeddings(
+            recommender.model,
+            cold_item_embeddings,
+            cold_quality_scores=cold_quality_scores,
+        )
 
     # Run evaluation
     test_interactions = load_data(config.dataset.test_filepath)

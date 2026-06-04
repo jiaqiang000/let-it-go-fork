@@ -1,0 +1,13 @@
+{
+  "meta_path": "/root/letitgo-runtime/let-it-go/row_data/meta_Beauty.json",
+  "processed_dir": "/root/letitgo-data/data/beauty/processed",
+  "warm_items": 11165,
+  "cold_items": 568,
+  "text_token_p5": 11.0,
+  "text_token_p95": 255.0,
+  "attr_p95": 3.5,
+  "quality_bucket_low_threshold": 0.75623,
+  "quality_bucket_high_threshold": 0.842611,
+  "warm_quality_mean": 0.790089,
+  "cold_quality_mean": 0.825866
+}

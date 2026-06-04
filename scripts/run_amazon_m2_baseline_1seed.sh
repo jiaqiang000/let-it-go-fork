@@ -20,6 +20,7 @@ DATA_ROOT=${DATA_ROOT:-/root/letitgo-data/data/amazon_m2_fr}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-/hy-tmp/letitgo_ckpt/amazon_m2_baseline_20260604}
 PROJECT_NAME=${PROJECT_NAME:-letitgo_amazon_m2_baseline}
 MAX_EPOCHS=${MAX_EPOCHS:-100}
+RUN_GROUPS=${RUN_GROUPS:-A2}
 DRY_RUN=${DRY_RUN:-0}
 CHECK_ONLY=${CHECK_ONLY:-0}
 
@@ -59,6 +60,11 @@ run_cmd() {
   fi
 }
 
+group_enabled() {
+  local group=$1
+  [[ ",$RUN_GROUPS," == *",$group,"* ]]
+}
+
 print_stage() {
   local current=$1
   local total=$2
@@ -66,6 +72,27 @@ print_stage() {
   echo
   echo "===== [${current}/${total}] ${message} ====="
 }
+
+GROUPS_TO_RUN=()
+IFS=',' read -ra REQUESTED_GROUPS <<< "$RUN_GROUPS"
+for group in "${REQUESTED_GROUPS[@]}"; do
+  case "$group" in
+    A0|A1|A2)
+      GROUPS_TO_RUN+=("$group")
+      ;;
+    "")
+      ;;
+    *)
+      echo "不支持的 RUN_GROUPS 分组：$group。当前脚本只支持 A0,A1,A2。" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ${#GROUPS_TO_RUN[@]} -eq 0 ]]; then
+  echo "RUN_GROUPS 不能为空。当前脚本支持 A0,A1,A2。" >&2
+  exit 1
+fi
 
 mkdir -p "$CHECKPOINT_DIR"
 
@@ -76,6 +103,7 @@ echo "DATA_ROOT=$DATA_ROOT"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
 echo "PROJECT_NAME=$PROJECT_NAME"
 echo "MAX_EPOCHS=$MAX_EPOCHS"
+echo "RUN_GROUPS=$RUN_GROUPS"
 echo "DRY_RUN=$DRY_RUN"
 echo "CHECK_ONLY=$CHECK_ONLY"
 
@@ -83,7 +111,7 @@ if [[ "$CHECK_ONLY" == "1" ]]; then
   print_stage 1 1 "检查 Amazon-M2 数据、embedding、模型入口，不启动训练"
   # 本地轻量 smoke test：只验证路径、数据形状、embedding 形状、模型类和数据集构建。
   # 目的：确认 Amazon-M2 入口没有接错；正式训练仍交给服务器。
-  PROJECT_ROOT="$PROJECT_ROOT" DATA_ROOT="$DATA_ROOT" "$PYTHON_BIN" - <<'PY'
+  PROJECT_ROOT="$PROJECT_ROOT" DATA_ROOT="$DATA_ROOT" RUN_GROUPS="$RUN_GROUPS" "$PYTHON_BIN" - <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -95,6 +123,7 @@ from omegaconf import OmegaConf
 
 project_root = Path(os.environ["PROJECT_ROOT"])
 data_root = Path(os.environ["DATA_ROOT"])
+groups = {group.strip() for group in os.environ["RUN_GROUPS"].split(",") if group.strip()}
 
 paths = {
     "train": data_root / "processed" / "train_interactions.parquet",
@@ -144,46 +173,109 @@ sys.path.insert(0, str(project_root / "scripts"))
 from run import get_datamodule, get_model  # noqa: E402
 
 
-config = OmegaConf.create(
+datamodule_config = OmegaConf.create(
     {
-        "use_pretrained_item_embeddings": True,
-        "train_delta": True,
-        "quality_aware_delta": False,
-        "max_delta_norm": 0.5,
         "dataset": {
             "train_filepath": str(paths["train"]),
             "val_filepath": str(paths["val"]),
             "max_length": 64,
         },
-        "model": {
-            "num_items": 42647,
-            "embedding_dim": 64,
-            "num_blocks": 2,
-            "num_heads": 1,
-            "p": 0.3,
-            "max_length": 64,
-        },
     }
 )
 
-model = get_model(config)
-datamodule = get_datamodule(config)
+datamodule = get_datamodule(datamodule_config)
 datamodule.setup("fit")
 
-print(f"  model={model.__class__.__name__}")
 print(f"  train_sequences={len(datamodule.train_dataset)}")
 print(f"  val_sequences={len(datamodule.val_dataset)}")
+
+group_configs = {
+    "A0": {
+        "use_pretrained_item_embeddings": False,
+        "train_delta": False,
+        "description": "init(rand) / 普通 SASRec",
+    },
+    "A1": {
+        "use_pretrained_item_embeddings": True,
+        "train_delta": False,
+        "description": "init(text) / content initialization",
+    },
+    "A2": {
+        "use_pretrained_item_embeddings": True,
+        "train_delta": True,
+        "description": "init(text)-delta-0.5 / trainable delta",
+    },
+}
+
+for group in ("A0", "A1", "A2"):
+    if group not in groups:
+        continue
+
+    config = OmegaConf.create(
+        {
+            "use_pretrained_item_embeddings": group_configs[group]["use_pretrained_item_embeddings"],
+            "train_delta": group_configs[group]["train_delta"],
+            "quality_aware_delta": False,
+            "max_delta_norm": 0.5,
+            "dataset": {
+                "train_filepath": str(paths["train"]),
+                "val_filepath": str(paths["val"]),
+                "max_length": 64,
+            },
+            "model": {
+                "num_items": 42647,
+                "embedding_dim": 64,
+                "num_blocks": 2,
+                "num_heads": 1,
+                "p": 0.3,
+                "max_length": 64,
+            },
+        }
+    )
+    model = get_model(config)
+    print(f"  {group}: {group_configs[group]['description']}")
+    print(f"    model={model.__class__.__name__}")
+    print(f"    use_pretrained_item_embeddings={config.use_pretrained_item_embeddings}")
+    print(f"    train_delta={config.train_delta}")
+
 print("CHECK_ONLY: Amazon-M2 baseline 入口检查通过。")
 PY
   exit 0
 fi
 
-# Amazon-M2 原版 Let It Go baseline：content initialization + trainable delta。
-# 这组对应 init(text)-delta-0.5，用来先确认 Amazon-M2 能跑通，不加入 q-aware 或字段扰动。
-print_stage 1 1 "启动 Amazon-M2 baseline 训练；后续 epoch/batch 进度由 Lightning 打印"
-run_cmd "$PYTHON_BIN" run.py \
-  seed="$SEED" \
-  "${COMMON_ARGS[@]}" \
-  use_pretrained_item_embeddings=True \
-  train_delta=True \
-  max_delta_norm=0.5
+i=0
+total=${#GROUPS_TO_RUN[@]}
+
+if group_enabled A0; then
+  i=$((i + 1))
+  # A0：普通 SASRec baseline。
+  # 目的：确认没有 content initialization 和 delta 时的 Amazon-M2 基础参照。
+  print_stage "$i" "$total" "A0: init(rand) / 普通 SASRec；后续 epoch/batch 进度由 Lightning 打印"
+  run_cmd "$PYTHON_BIN" run.py \
+    seed="$SEED" \
+    "${COMMON_ARGS[@]}"
+fi
+
+if group_enabled A1; then
+  i=$((i + 1))
+  # A1：content initialization。
+  # 目的：确认作者给好的 Amazon-M2 content embeddings 进入 SASRec 后的参照。
+  print_stage "$i" "$total" "A1: init(text) / content initialization；后续 epoch/batch 进度由 Lightning 打印"
+  run_cmd "$PYTHON_BIN" run.py \
+    seed="$SEED" \
+    "${COMMON_ARGS[@]}" \
+    use_pretrained_item_embeddings=True
+fi
+
+if group_enabled A2; then
+  i=$((i + 1))
+  # A2：Amazon-M2 原版 Let It Go baseline：content initialization + trainable delta。
+  # 这组对应 init(text)-delta-0.5，用来对齐论文主结果，不加入 q-aware 或字段扰动。
+  print_stage "$i" "$total" "A2: init(text)-delta-0.5 / trainable delta；后续 epoch/batch 进度由 Lightning 打印"
+  run_cmd "$PYTHON_BIN" run.py \
+    seed="$SEED" \
+    "${COMMON_ARGS[@]}" \
+    use_pretrained_item_embeddings=True \
+    train_delta=True \
+    max_delta_norm=0.5
+fi

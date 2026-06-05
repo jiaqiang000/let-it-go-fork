@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--products-path", type=Path, default=DEFAULT_PRODUCTS_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--locale",
+        default="FR",
+        help="Amazon-M2 locale；默认和作者 amazon_m2_fr 预处理链路一致使用 FR。",
+    )
     parser.add_argument("--a1-checkpoint", type=Path, default=DEFAULT_A1_CHECKPOINT)
     parser.add_argument("--a2-checkpoint", type=Path, default=DEFAULT_A2_CHECKPOINT)
     parser.add_argument(
@@ -185,6 +190,20 @@ def build_field_profile(
     return pl.from_dicts(rows)
 
 
+def filter_products_by_locale(products: pl.DataFrame, locale: str) -> pl.DataFrame:
+    if "locale" not in products.columns:
+        raise ValueError("products_train.csv 缺少 locale 字段，无法按 Amazon-M2 FR 口径分组。")
+
+    # 中文注释：作者的 Amazon-M2 预处理链路使用 locale='FR'。
+    # 自然字段完整度分组也必须只读取同一 locale 的商品元数据，
+    # 否则同一 item id 的其他地区字段可能覆盖 FR 字段，导致分组口径不一致。
+    filtered = products.filter(pl.col("locale") == locale)
+    if filtered.is_empty():
+        raise ValueError(f"products_train.csv 中没有 locale={locale!r} 的商品记录。")
+
+    return filtered
+
+
 def build_ground_truth_groups(
     ground_truth: pl.DataFrame,
     field_profile: pl.DataFrame,
@@ -214,10 +233,10 @@ def build_count_table(field_profile: pl.DataFrame, ground_truth_groups: pl.DataF
         .agg(
             [
                 pl.len().alias("cold_ground_truth_rows"),
-                pl.col("user_id").n_unique().alias("cold_users"),
+                pl.col("user_id").n_unique().alias("gt_user_id_count"),
             ]
         )
-        .select(["field_group", "cold_ground_truth_rows", "cold_users"])
+        .select(["field_group", "cold_ground_truth_rows", "gt_user_id_count"])
     )
 
     groups = pl.DataFrame({"field_group": list(FIELD_GROUP_ORDER)})
@@ -229,7 +248,7 @@ def build_count_table(field_profile: pl.DataFrame, ground_truth_groups: pl.DataF
             [
                 pl.col("cold_items").cast(pl.Int64),
                 pl.col("cold_ground_truth_rows").cast(pl.Int64),
-                pl.col("cold_users").cast(pl.Int64),
+                pl.col("gt_user_id_count").cast(pl.Int64),
             ]
         )
     )
@@ -373,17 +392,25 @@ def compute_group_metrics(
 
     for group_name in FIELD_GROUP_ORDER:
         group_gt = ground_truth_groups.filter(pl.col("field_group") == group_name)
-        group_predictions = recommendations.filter(
-            pl.col("user_id").is_in(group_gt.get_column("user_id"))
-        )
-        metrics = evaluator(group_predictions, group_gt)
+        if len(group_gt) == 0:
+            # 中文注释：missing_metadata 这类空组不能交给 ColdStartOfflineMetrics，
+            # 否则原 evaluator 在 cold/warm 加权平均时会出现 0/0。
+            metrics = {
+                f"cold_NDCG@{topk}": 0.0,
+                f"cold_Recall@{topk}": 0.0,
+            }
+        else:
+            group_predictions = recommendations.filter(
+                pl.col("user_id").is_in(group_gt.get_column("user_id"))
+            )
+            metrics = evaluator(group_predictions, group_gt)
 
         rows.append(
             {
                 "model": model_name,
                 "field_group": group_name,
                 "cold_ground_truth_rows": len(group_gt),
-                "cold_users": group_gt.get_column("user_id").n_unique() if len(group_gt) else 0,
+                "gt_user_id_count": group_gt.get_column("user_id").n_unique() if len(group_gt) else 0,
                 f"cold_NDCG@{topk}": float(metrics[f"cold_NDCG@{topk}"]),
                 f"cold_Recall@{topk}": float(metrics[f"cold_Recall@{topk}"]),
             }
@@ -457,6 +484,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     products = pl.read_csv(paths["products"])
+    products_before_locale_filter = len(products)
+    products = filter_products_by_locale(products, args.locale)
     ground_truth = pl.read_parquet(paths["ground_truth"])
     cold_item2index = normalize_item2index(
         load_pickle(paths["item2index_cold"]),
@@ -478,6 +507,9 @@ def main() -> None:
     print("Amazon-M2 field group evaluation")
     print("data_root:", paths["data_root"])
     print("products:", paths["products"])
+    print("locale:", args.locale)
+    print("products_rows_before_locale_filter:", products_before_locale_filter)
+    print("products_rows_after_locale_filter:", len(products))
     print("output_dir:", output_dir)
     print("warm_items:", len(warm_item2index))
     print("cold_items:", len(field_profile))
@@ -489,6 +521,9 @@ def main() -> None:
         "data_root": str(paths["data_root"]),
         "products_path": str(paths["products"]),
         "output_dir": str(output_dir),
+        "locale": args.locale,
+        "products_rows_before_locale_filter": products_before_locale_filter,
+        "products_rows_after_locale_filter": len(products),
         "fields": list(FIELD_NAMES),
         "models": parse_models(args.models),
         "check_only": args.check_only,

@@ -1,0 +1,478 @@
+"""生成 Amazon-M2 degraded-view 训练 pilot 所需的 warm/cold embedding。
+
+本脚本只准备训练输入，不训练模型，也不修改 source/ 或 scripts/run.py。
+用途：
+
+1. 生成 control_full、title_trunc_N、no_title、random_title_dropout_pXX 等
+   warm/cold content embedding；
+2. 让服务器端可以用原始 Let It Go 训练入口跑最小方法 pilot；
+3. 保留 item-level degraded-view profile，方便之后解释训练结果。
+
+注意：random_title_dropout_pXX 是 item-level deterministic dropout，不是 batch 内
+动态增强。它是一个必要弱基线，不能等同于最终 consistency loss 方法。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pickle
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RESEARCH_ROOT = PROJECT_ROOT.parent
+LOCAL_DATA_ROOT = RESEARCH_ROOT / "letitgo-data" / "data" / "amazon_m2_fr"
+SERVER_DATA_ROOT = Path("/root/letitgo-data/data/amazon_m2_fr")
+DEFAULT_DATA_ROOT = SERVER_DATA_ROOT if SERVER_DATA_ROOT.exists() else LOCAL_DATA_ROOT
+DEFAULT_PRODUCTS_PATH = PROJECT_ROOT / "row_data" / "amazon_m2_raw" / "products_train.csv"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "amazon_m2_degraded_view_training_embeddings"
+
+METADATA_COLUMNS = ("title", "brand", "color", "size", "model", "material", "author")
+FIELD_NAMES = ("color", "size", "model", "material")
+MISSING_STRINGS = {"", "null", "none", "nan", "[]"}
+DEFAULT_VARIANTS = "control_full,title_trunc_8,random_title_dropout_p30,no_title"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build warm/cold Amazon-M2 degraded-view embeddings for training pilot."
+    )
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--products-path", type=Path, default=DEFAULT_PRODUCTS_PATH)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--variants", default=DEFAULT_VARIANTS)
+    parser.add_argument("--locale", default="FR")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--sentence-checkpoint", default="intfloat/multilingual-e5-base")
+    parser.add_argument("--encode-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="只检查输入和样本对齐，不加载 SentenceTransformer，不生成 embedding。",
+    )
+    return parser.parse_args()
+
+
+def parse_csv_list(value: str) -> list[str]:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise ValueError("variants 不能为空。")
+    unsupported = [item for item in items if not is_supported_variant(item)]
+    if unsupported:
+        raise ValueError(f"不支持的 degraded-view 训练 variant：{unsupported}")
+    return items
+
+
+def is_supported_variant(variant: str) -> bool:
+    return (
+        variant == "control_full"
+        or variant == "no_title"
+        or re.fullmatch(r"title_trunc_\d+", variant) is not None
+        or re.fullmatch(r"random_title_dropout_p\d{1,3}", variant) is not None
+    )
+
+
+def resolve_paths(data_root: Path, products_path: Path, output_dir: Path) -> dict[str, Path]:
+    data_root = data_root.expanduser().resolve()
+    return {
+        "data_root": data_root,
+        "products": products_path.expanduser().resolve(),
+        "output_dir": output_dir.expanduser().resolve(),
+        "item2index_warm": data_root / "processed" / "item2index_warm.pkl",
+        "item2index_cold": data_root / "processed" / "item2index_cold.pkl",
+        "author_warm_embeddings": data_root / "item_embeddings" / "embeddings_warm.npy",
+        "author_cold_embeddings": data_root / "item_embeddings" / "embeddings_cold.npy",
+    }
+
+
+def require_files(paths: dict[str, Path], names: list[str]) -> None:
+    missing = [name for name in names if not paths[name].is_file()]
+    if missing:
+        details = "\n".join(f"{name}: {paths[name]}" for name in missing)
+        raise FileNotFoundError(f"缺少必要输入文件：\n{details}")
+
+
+def load_pickle(path: Path) -> Any:
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def normalize_item2index(mapping: dict[Any, Any], name: str) -> dict[str, int]:
+    if not mapping:
+        raise ValueError(f"{name} 为空。")
+
+    first_key, first_value = next(iter(mapping.items()))
+    if isinstance(first_key, str) and isinstance(first_value, int):
+        return {str(key): int(value) for key, value in mapping.items()}
+    if isinstance(first_key, int) and isinstance(first_value, str):
+        return {str(value): int(key) for key, value in mapping.items()}
+
+    raise TypeError(
+        f"{name} 的方向无法识别：key={type(first_key).__name__}, "
+        f"value={type(first_value).__name__}"
+    )
+
+
+def clean_cell(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in MISSING_STRINGS else text
+
+
+def is_present_value(value: object) -> bool:
+    return bool(clean_cell(value))
+
+
+def truncate_words(text: str, limit: int) -> str:
+    if limit <= 0:
+        raise ValueError(f"title truncation limit 必须为正数：{limit}")
+    return " ".join(clean_cell(text).split()[:limit])
+
+
+def stable_random_value(raw_item_id: str, seed: int, salt: str) -> float:
+    """返回 [0, 1) 的稳定伪随机数，保证不同机器/进程结果一致。"""
+
+    payload = f"{seed}:{salt}:{raw_item_id}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) / float(2**64)
+
+
+def parse_title_trunc_limit(variant: str) -> int | None:
+    match = re.fullmatch(r"title_trunc_(\d+)", variant)
+    return int(match.group(1)) if match else None
+
+
+def parse_dropout_probability(variant: str) -> float | None:
+    match = re.fullmatch(r"random_title_dropout_p(\d{1,3})", variant)
+    if not match:
+        return None
+    probability = int(match.group(1)) / 100.0
+    if probability < 0.0 or probability > 1.0:
+        raise ValueError(f"dropout 概率必须在 [0, 100]：{variant}")
+    return probability
+
+
+def title_for_variant(row: dict[str, object], variant: str, seed: int) -> tuple[str, str]:
+    title = clean_cell(row.get("title"))
+    if variant == "control_full":
+        return title, "keep"
+    if variant == "no_title":
+        return "", "drop"
+
+    trunc_limit = parse_title_trunc_limit(variant)
+    if trunc_limit is not None:
+        return truncate_words(title, trunc_limit), f"trunc_{trunc_limit}"
+
+    dropout_probability = parse_dropout_probability(variant)
+    if dropout_probability is not None:
+        raw_item_id = str(row.get("raw_item_id", ""))
+        should_drop = stable_random_value(raw_item_id, seed, variant) < dropout_probability
+        return ("", "drop_random") if should_drop else (title, "keep_random")
+
+    raise ValueError(f"不支持的 variant：{variant}")
+
+
+def compose_degraded_training_text(
+    row: dict[str, object],
+    variant: str,
+    seed: int = 42,
+) -> str:
+    title, _ = title_for_variant(row, variant, seed=seed)
+    parts = []
+    for column in METADATA_COLUMNS:
+        value = title if column == "title" else clean_cell(row.get(column))
+        if value:
+            parts.append(f"{column}: {value}")
+    return "; ".join(parts)
+
+
+def assign_field_group(present_count: int, metadata_found: bool = True) -> str:
+    if not metadata_found:
+        return "missing_metadata"
+    if present_count <= 1:
+        return "weak_0_1"
+    if present_count == 2:
+        return "mid_2"
+    return "strong_3_4"
+
+
+def read_products_by_id(
+    products_path: Path,
+    required_ids: set[str],
+    locale: str,
+    chunksize: int = 200_000,
+) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
+    required_columns = ["id", "locale", *METADATA_COLUMNS]
+    header = pd.read_csv(products_path, nrows=0).columns.tolist()
+    missing = sorted(set(required_columns) - set(header))
+    if missing:
+        raise ValueError(f"products_train.csv 缺少字段：{missing}")
+
+    products_by_id: dict[str, dict[str, str]] = {}
+    total_rows = 0
+    locale_rows = 0
+    matched_rows = 0
+
+    for chunk in pd.read_csv(
+        products_path,
+        usecols=required_columns,
+        dtype=str,
+        chunksize=chunksize,
+    ):
+        total_rows += len(chunk)
+        locale_chunk = chunk[chunk["locale"] == locale]
+        locale_rows += len(locale_chunk)
+        matched = locale_chunk[locale_chunk["id"].isin(required_ids)]
+        matched_rows += len(matched)
+        for record in matched.to_dict("records"):
+            product_id = str(record["id"])
+            products_by_id[product_id] = {key: clean_cell(value) for key, value in record.items()}
+
+    summary = {
+        "products_total_rows": total_rows,
+        "products_locale_rows": locale_rows,
+        "matched_rows": matched_rows,
+        "matched_unique_ids": len(products_by_id),
+        "required_unique_ids": len(required_ids),
+        "missing_required_ids": len(required_ids - set(products_by_id)),
+        "locale": locale,
+    }
+    return products_by_id, summary
+
+
+def build_item_rows(
+    item2index: dict[str, int],
+    products_by_id: dict[str, dict[str, str]],
+    split: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for position, (raw_item_id, model_item_id) in enumerate(
+        sorted(item2index.items(), key=lambda pair: pair[1])
+    ):
+        product = products_by_id.get(raw_item_id)
+        metadata_found = product is not None
+        product = product or {}
+        row: dict[str, object] = {
+            "split": split,
+            "raw_item_id": raw_item_id,
+            "item_id": int(model_item_id),
+            "position_in_embedding_file": int(position),
+            "metadata_found": metadata_found,
+        }
+        for column in METADATA_COLUMNS:
+            row[column] = clean_cell(product.get(column))
+            row[f"{column}_present"] = is_present_value(product.get(column))
+        present_count = sum(bool(row[f"{field}_present"]) for field in FIELD_NAMES)
+        row["present_field_count"] = int(present_count)
+        row["field_group"] = assign_field_group(present_count, metadata_found)
+        rows.append(row)
+    return rows
+
+
+def build_variant_profile(rows: list[dict[str, object]], variants: list[str], seed: int) -> pd.DataFrame:
+    profile_rows = []
+    for row in rows:
+        original_title_tokens = len(clean_cell(row.get("title")).split())
+        for variant in variants:
+            title, action = title_for_variant(row, variant, seed=seed)
+            text = compose_degraded_training_text(row, variant, seed=seed)
+            profile_rows.append(
+                {
+                    "split": row["split"],
+                    "raw_item_id": row["raw_item_id"],
+                    "item_id": row["item_id"],
+                    "field_group": row["field_group"],
+                    "variant": variant,
+                    "title_action": action,
+                    "original_title_tokens": original_title_tokens,
+                    "retained_title_tokens": len(title.split()),
+                    "text_empty": not bool(text),
+                }
+            )
+    return pd.DataFrame(profile_rows)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    a_norm = np.linalg.norm(a, axis=1).clip(min=1e-12)
+    b_norm = np.linalg.norm(b, axis=1).clip(min=1e-12)
+    return (a * b).sum(axis=1) / (a_norm * b_norm)
+
+
+def summarize_values(values: np.ndarray) -> dict[str, object]:
+    values = np.asarray(values, dtype=np.float32)
+    return {
+        "count": int(values.shape[0]),
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "min": float(values.min()),
+        "p05": float(np.quantile(values, 0.05)),
+        "p50": float(np.quantile(values, 0.50)),
+        "p95": float(np.quantile(values, 0.95)),
+        "max": float(values.max()),
+        "below_0_999": int((values < 0.999).sum()),
+        "below_0_99": int((values < 0.99).sum()),
+        "below_0_95": int((values < 0.95).sum()),
+    }
+
+
+def encode_variant(model: Any, rows: list[dict[str, object]], variant: str, seed: int, batch_size: int) -> np.ndarray:
+    texts = [compose_degraded_training_text(row, variant, seed=seed) for row in rows]
+    print(f"Encoding split={rows[0]['split'] if rows else 'empty'} variant={variant}, items={len(texts)}")
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=False,
+    )
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def save_variant(output_dir: Path, variant: str, warm_embeddings: np.ndarray, cold_embeddings: np.ndarray) -> dict[str, str]:
+    item_embedding_dir = output_dir / variant / "item_embeddings"
+    item_embedding_dir.mkdir(parents=True, exist_ok=True)
+    warm_path = item_embedding_dir / "embeddings_warm.npy"
+    cold_path = item_embedding_dir / "embeddings_cold.npy"
+    np.save(warm_path, warm_embeddings.astype(np.float32))
+    np.save(cold_path, cold_embeddings.astype(np.float32))
+    return {"warm": str(warm_path), "cold": str(cold_path)}
+
+
+def main() -> None:
+    args = parse_args()
+    variants = parse_csv_list(args.variants)
+    paths = resolve_paths(args.data_root, args.products_path, args.output_dir)
+    require_files(
+        paths,
+        [
+            "products",
+            "item2index_warm",
+            "item2index_cold",
+            "author_warm_embeddings",
+            "author_cold_embeddings",
+        ],
+    )
+    output_dir = paths["output_dir"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    warm_item2index = normalize_item2index(load_pickle(paths["item2index_warm"]), "item2index_warm")
+    cold_item2index = normalize_item2index(load_pickle(paths["item2index_cold"]), "item2index_cold")
+    required_ids = set(warm_item2index) | set(cold_item2index)
+    products_by_id, product_summary = read_products_by_id(paths["products"], required_ids, args.locale)
+    warm_rows = build_item_rows(warm_item2index, products_by_id, split="warm")
+    cold_rows = build_item_rows(cold_item2index, products_by_id, split="cold")
+
+    author_warm = np.load(paths["author_warm_embeddings"])
+    author_cold = np.load(paths["author_cold_embeddings"])
+    if author_warm.shape[0] != len(warm_rows):
+        raise ValueError(f"warm embedding 行数不匹配：{author_warm.shape[0]} vs {len(warm_rows)}")
+    if author_cold.shape[0] != len(cold_rows):
+        raise ValueError(f"cold embedding 行数不匹配：{author_cold.shape[0]} vs {len(cold_rows)}")
+
+    profile = build_variant_profile([*warm_rows, *cold_rows], variants, seed=args.seed)
+    profile.to_csv(output_dir / "degraded_view_training_item_profile.csv", index=False)
+    profile_summary = (
+        profile.groupby(["split", "variant", "field_group", "title_action"], dropna=False)
+        .agg(
+            item_count=("item_id", "size"),
+            mean_original_title_tokens=("original_title_tokens", "mean"),
+            mean_retained_title_tokens=("retained_title_tokens", "mean"),
+            empty_text_rate=("text_empty", "mean"),
+        )
+        .reset_index()
+    )
+    profile_summary.to_csv(output_dir / "degraded_view_training_profile_summary.csv", index=False)
+
+    manifest: dict[str, Any] = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "script_role": "prepare degraded-view warm/cold embeddings for server training pilot",
+        "data_root": str(paths["data_root"]),
+        "products_path": str(paths["products"]),
+        "output_dir": str(output_dir),
+        "locale": args.locale,
+        "seed": args.seed,
+        "sentence_checkpoint": args.sentence_checkpoint,
+        "variants": variants,
+        "check_only": args.check_only,
+        "warm_items": len(warm_rows),
+        "cold_items": len(cold_rows),
+        "author_warm_shape": list(author_warm.shape),
+        "author_cold_shape": list(author_cold.shape),
+        "product_summary": product_summary,
+    }
+
+    if args.check_only:
+        (output_dir / "run_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print("CHECK_ONLY: 输入、字段和 warm/cold 对齐检查完成；未加载 E5，未生成 embedding。")
+        return
+
+    from sentence_transformers import SentenceTransformer
+
+    print(f"Loading SentenceTransformer: {args.sentence_checkpoint}")
+    sentence_model = SentenceTransformer(args.sentence_checkpoint)
+    embedding_paths: dict[str, dict[str, str]] = {}
+    generated_embeddings: dict[tuple[str, str], np.ndarray] = {}
+    summary_rows: list[dict[str, object]] = []
+
+    for index, variant in enumerate(variants, start=1):
+        print()
+        print(f"===== [{index}/{len(variants)}] variant={variant} START =====")
+        warm_embeddings = encode_variant(sentence_model, warm_rows, variant, seed=args.seed, batch_size=args.encode_batch_size)
+        cold_embeddings = encode_variant(sentence_model, cold_rows, variant, seed=args.seed, batch_size=args.encode_batch_size)
+        embedding_paths[variant] = save_variant(output_dir, variant, warm_embeddings, cold_embeddings)
+        generated_embeddings[("warm", variant)] = warm_embeddings
+        generated_embeddings[("cold", variant)] = cold_embeddings
+
+        warm_to_author = summarize_values(cosine_similarity(warm_embeddings, author_warm))
+        warm_to_author.update({"split": "warm", "variant": variant, "compared_to": "author"})
+        cold_to_author = summarize_values(cosine_similarity(cold_embeddings, author_cold))
+        cold_to_author.update({"split": "cold", "variant": variant, "compared_to": "author"})
+        summary_rows.extend([warm_to_author, cold_to_author])
+
+        print(f"saved warm: {embedding_paths[variant]['warm']}")
+        print(f"saved cold: {embedding_paths[variant]['cold']}")
+        print(f"===== [{index}/{len(variants)}] variant={variant} DONE =====")
+
+    if "control_full" in variants:
+        control_warm = generated_embeddings[("warm", "control_full")]
+        control_cold = generated_embeddings[("cold", "control_full")]
+        for variant in variants:
+            if variant == "control_full":
+                continue
+            warm = generated_embeddings[("warm", variant)]
+            cold = generated_embeddings[("cold", variant)]
+            warm_to_control = summarize_values(cosine_similarity(warm, control_warm))
+            warm_to_control.update({"split": "warm", "variant": variant, "compared_to": "control_full"})
+            cold_to_control = summarize_values(cosine_similarity(cold, control_cold))
+            cold_to_control.update({"split": "cold", "variant": variant, "compared_to": "control_full"})
+            summary_rows.extend([warm_to_control, cold_to_control])
+
+    pd.DataFrame(summary_rows).to_csv(output_dir / "variant_embedding_summary.csv", index=False)
+    manifest["embedding_paths"] = embedding_paths
+    (output_dir / "run_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print("DONE: degraded-view training embeddings 已生成。")
+
+
+if __name__ == "__main__":
+    main()
